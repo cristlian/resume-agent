@@ -34,6 +34,7 @@ WORKSPACE_DIR = Path(__file__).parent.resolve()
 DEFAULT_RESUME = WORKSPACE_DIR / "Yifei-Lian-Resume-merged.pdf"
 JD_FOLDER = WORKSPACE_DIR / "JD"
 TAILORED_RESUMES_FOLDER = WORKSPACE_DIR / "tailored_resumes"
+APPLICATION_RESPONSES_FOLDER = WORKSPACE_DIR / "application_question_response"
 MAX_RETRIES = 4
 RETRY_BASE_SECONDS = 2
 RETRY_MAX_SECONDS = 20
@@ -594,6 +595,106 @@ def save_resume_as_word(content: str, role_name: str) -> Path:
     return filepath
 
 
+def get_application_questions() -> list[str]:
+    """Prompt user to enter application questions. Returns list of questions."""
+    print("\n" + "=" * 60)
+    print("=== APPLICATION QUESTIONS ===")
+    print("=" * 60)
+    print("Enter your application questions (one per line).")
+    print("Press Enter on an empty line when done, or type 'skip' to skip.")
+    print("-" * 40)
+    
+    questions = []
+    question_num = 1
+    while True:
+        try:
+            line = input(f"Q{question_num}: ").strip()
+        except EOFError:
+            break
+        
+        if line.lower() == 'skip':
+            return []
+        if not line:
+            if questions:  # Only break if we have at least one question
+                break
+            continue  # Ignore empty first line
+        
+        questions.append(line)
+        question_num += 1
+    
+    return questions
+
+
+def run_application_response(
+    client: genai.Client,
+    jd_content: str,
+    resume: str,
+    questions: list[str],
+) -> str:
+    """Generate high-quality responses to application questions."""
+    
+    questions_formatted = "\n".join([f"[Question {i+1}] {q}" for i, q in enumerate(questions)])
+    
+    prompt = f"""Based on the latest resume and JD, draft high quality responses to these job application questions/cover letter:
+
+{questions_formatted}
+
+You must strictly follow the below instructions:
+- Tone: passionate, sincere, natural, fluent, persuasive, confident
+- Length: max 2 short paragraphs per question
+- Output format: Plain text only (NO markdown, NO asterisks, NO bullet points)
+- Structure each response with a clear header like "QUESTION 1: [question text]" followed by the response
+
+---
+
+JOB DESCRIPTION:
+{jd_content}
+
+---
+
+RESUME:
+{resume}
+"""
+    
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.7,
+            max_output_tokens=4096,
+        ),
+    )
+    
+    return response.text
+
+
+def save_application_responses(content: str, role_name: str) -> Path:
+    """Save application question responses to a txt file."""
+    # Ensure folder exists
+    APPLICATION_RESPONSES_FOLDER.mkdir(exist_ok=True)
+    
+    # Generate filename with role and date
+    date_str = datetime.datetime.now().strftime("%Y%m%d")
+    safe_role = re.sub(r'[^\w\s-]', '', role_name).strip().replace(' ', '_')
+    filename = f"{safe_role}_responses_{date_str}.txt"
+    filepath = APPLICATION_RESPONSES_FOLDER / filename
+    
+    # Add header for easy copy-paste
+    header = f"""{'=' * 60}
+APPLICATION RESPONSES
+Role: {role_name}
+Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
+{'=' * 60}
+
+"""
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(header + content)
+    
+    print(f"Saved responses: {filepath}")
+    return filepath
+
+
 def main() -> None:
     """Main entry point."""
     total_start = time.perf_counter()
@@ -717,10 +818,32 @@ def main() -> None:
     save_output("Final_Resume.txt", final_resume)
     
     # === PHASE 5: Convert to Word and save to tailored_resumes folder ===
-    print("\n[Phase 5/5] Converting to Word format...")
+    print("\n[Phase 5/6] Converting to Word format...")
     with timed_section("Word conversion"):
         role_name = extract_role_from_jd_filename(jd_path)
         word_path = save_resume_as_word(final_resume, role_name)
+    
+    # === PHASE 6: Application Question Responses ===
+    print("\n[Phase 6/6] Application Question Responses (Optional)")
+    questions = get_application_questions()
+    
+    responses_path = None
+    if questions:
+        print(f"\nGenerating responses for {len(questions)} question(s)...")
+        with Spinner("Crafting responses"), timed_section("Application Responses API"):
+            try:
+                # Use text content for JD if it was extracted
+                jd_text = jd_content if isinstance(jd_content, str) else "[JD content from PDF]"
+                responses = run_application_response(client, jd_text, final_resume, questions)
+            except Exception as e:
+                print(f"ERROR: Failed to generate responses: {e}", file=sys.stderr)
+                responses = None
+        
+        if responses:
+            print_section("APPLICATION RESPONSES", responses)
+            responses_path = save_application_responses(responses, role_name)
+    else:
+        print("Skipped application questions.")
     
     # Total time
     total_elapsed = time.perf_counter() - total_start
@@ -729,6 +852,8 @@ def main() -> None:
     print(f"COMPLETE! Your tailored resume is saved to:")
     print(f"  - Word: {word_path}")
     print(f"  - Text: {WORKSPACE_DIR / 'Final_Resume.txt'}")
+    if responses_path:
+        print(f"  - Responses: {responses_path}")
     print(f"  - Total time: {total_elapsed:.2f}s")
     print("=" * 60)
 
