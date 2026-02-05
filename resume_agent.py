@@ -625,15 +625,79 @@ def get_application_questions() -> list[str]:
     return questions
 
 
+def extract_length_constraint(question: str) -> str:
+    """
+    Extract length constraints from a question.
+    Returns a specific constraint string or default.
+    
+    Examples detected:
+    - "in two sentences" -> "exactly 2 sentences"
+    - "in 100 words" -> "approximately 100 words"
+    - "max 200 characters" -> "maximum 200 characters"
+    - "in one paragraph" -> "exactly 1 paragraph"
+    - "briefly describe" -> "2-3 sentences (brief)"
+    """
+    q_lower = question.lower()
+    
+    # Pattern: "in X sentence(s)" or "X sentence(s)"
+    sentence_match = re.search(r'(?:in\s+)?(\d+|one|two|three|four|five)\s+sentences?', q_lower)
+    if sentence_match:
+        num = sentence_match.group(1)
+        num_map = {'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5'}
+        num = num_map.get(num, num)
+        return f"exactly {num} sentence(s)"
+    
+    # Pattern: "in X words" or "max/maximum X words" or "under X words"
+    word_match = re.search(r'(?:in\s+|max(?:imum)?\s+|under\s+|within\s+)?(\d+)\s+words?', q_lower)
+    if word_match:
+        num = word_match.group(1)
+        if 'max' in q_lower or 'under' in q_lower:
+            return f"maximum {num} words"
+        return f"approximately {num} words"
+    
+    # Pattern: "X characters" or "max X characters"
+    char_match = re.search(r'(?:max(?:imum)?\s+|under\s+)?(\d+)\s+characters?', q_lower)
+    if char_match:
+        num = char_match.group(1)
+        return f"maximum {num} characters"
+    
+    # Pattern: "in X paragraph(s)" or "one paragraph"
+    para_match = re.search(r'(?:in\s+)?(\d+|one|two|three)\s+paragraphs?', q_lower)
+    if para_match:
+        num = para_match.group(1)
+        num_map = {'one': '1', 'two': '2', 'three': '3'}
+        num = num_map.get(num, num)
+        return f"exactly {num} paragraph(s)"
+    
+    # Pattern: "briefly" or "brief"
+    if re.search(r'\bbrief(?:ly)?\b', q_lower):
+        return "2-3 sentences (keep it brief)"
+    
+    # Pattern: "concise" or "concisely"
+    if re.search(r'\bconcise(?:ly)?\b', q_lower):
+        return "3-4 sentences (be concise)"
+    
+    # Default
+    return "max 2 short paragraphs"
+
+
 def run_application_response(
     client: genai.Client,
     jd_content: str,
     resume: str,
     questions: list[str],
 ) -> str:
-    """Generate high-quality responses to application questions."""
+    """Generate high-quality responses to application questions with dynamic length constraints."""
     
-    questions_formatted = "\n".join([f"[Question {i+1}] {q}" for i, q in enumerate(questions)])
+    # Build questions with individual constraints
+    questions_with_constraints = []
+    for i, q in enumerate(questions):
+        constraint = extract_length_constraint(q)
+        questions_with_constraints.append(
+            f"[Question {i+1}] {q}\n   >> LENGTH CONSTRAINT: {constraint}"
+        )
+    
+    questions_formatted = "\n\n".join(questions_with_constraints)
     
     prompt = f"""Based on the latest resume and JD, draft high quality responses to these job application questions/cover letter:
 
@@ -641,9 +705,11 @@ def run_application_response(
 
 You must strictly follow the below instructions:
 - Tone: passionate, sincere, natural, fluent, persuasive, confident
-- Length: max 2 short paragraphs per question
+- Length: STRICTLY FOLLOW THE LENGTH CONSTRAINT specified for each question above. This is critical.
 - Output format: Plain text only (NO markdown, NO asterisks, NO bullet points)
 - Structure each response with a clear header like "QUESTION 1: [question text]" followed by the response
+
+IMPORTANT: If a question specifies "two sentences", your response MUST be exactly two sentences. If it says "100 words", aim for approximately 100 words. Violating length constraints will disqualify the application.
 
 ---
 
