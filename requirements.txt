@@ -1,3 +1,4 @@
 ﻿google-genai>=1.0.0
 pypdf>=3.0.0
 python-docx>=1.0.0
+PyYAML>=6.0.0

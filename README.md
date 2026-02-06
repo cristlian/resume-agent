@@ -4,11 +4,19 @@ A CLI tool that optimizes your resume for a target job description using Gemini 
 
 ## Features
 
-- **4-Phase Workflow**: Draft -> Critique -> Human Input -> Final Resume
-- **PDF Input**: Accepts job description and resume as PDF files
-- **Dual-Agent Architecture**: Architect (optimizer) and Critic (brutal reviewer) with isolated contexts
-- **ATS Optimization**: Keyword extraction and alignment for Applicant Tracking Systems
-- **Plain Text Output**: Clean, ATS-friendly format without markdown
+- Phase 0-aligned JD ingestion:
+  - `--jd-url` (fetch HTML and extract text, fallback to pasted text)
+  - `--jd-text` (direct inline JD text)
+  - `--jd-pdf` (existing PDF flow)
+- Dual-agent architecture: Architect (writer) and Critic (strict reviewer)
+- Structured Critic categories:
+  - `A) Needs user input (blocking)`
+  - `B) Auto-fixable`
+  - `C) Already covered`
+  - `D) Optional`
+- Conditional user pause: prompts for clarification only when section `A` is non-empty
+- Profile facts support via `profile_facts.yaml`
+- Plain-text enforcement for saved outputs (markdown-like formatting is normalized)
 
 ## Requirements
 
@@ -29,37 +37,51 @@ A CLI tool that optimizes your resume for a target job description using Gemini 
 
 3. Set your Gemini API key:
 
-   **PowerShell:**
+   PowerShell:
    ```
    $env:GEMINI_API_KEY = "your-api-key-here"
    ```
 
-   **Or pass directly:**
+   Or pass directly:
    ```
    python resume_agent.py --api-key "your-api-key-here" ...
    ```
 
 ## Usage
 
-```
-python resume_agent.py --jd-pdf <path-to-job-description.pdf> --resume-pdf <path-to-your-resume.pdf>
+```bash
+python resume_agent.py --jd-url "<job-posting-url>" --resume-pdf <path-to-your-resume.pdf>
 ```
 
-### Example
+### Examples
 
-```
-python resume_agent.py --jd-pdf "Job_Description.pdf" --resume-pdf "My_Resume.pdf"
+```bash
+python resume_agent.py --jd-pdf "JD/VSIM_Job_Description.pdf" --resume-pdf "Yifei-Lian-Resume-merged.pdf"
+python resume_agent.py --jd-text "We are hiring a robotics ML engineer..." --resume-pdf "Yifei-Lian-Resume-merged.pdf"
+python resume_agent.py --jd-url "https://example.com/job/123" --resume-pdf "Yifei-Lian-Resume-merged.pdf"
 ```
 
 ## Workflow
 
-1. **Phase 1 - Draft**: The Architect agent analyzes both PDFs and creates an initial tailored resume
-2. **Phase 2 - Critique**: The Critic agent identifies 5 specific problems with the draft
-3. **Phase 3 - Human Input**: You can optionally provide clarifications or additional instructions
-4. **Phase 4 - Final**: The Architect incorporates feedback and produces the final optimized resume
+1. Draft: Architect tailors a one-page resume from JD + resume + profile facts.
+2. Critique: Critic outputs structured `A/B/C/D` findings.
+3. Conditional clarification: user input is requested only if section `A` has blocking issues.
+4. Finalize: Architect rewrites with critique + optional user input.
+5. Artifacts: text and docx outputs are saved.
 
 ## Output Files
 
-- Final_Resume.txt - Your tailored resume (main output)
-- Draft_Resume.txt - Initial draft from Phase 1
-- Critique.txt - Feedback from Phase 2
+- `Final_Resume.txt` - final tailored resume (plain text)
+- `Draft_Resume.txt` - initial draft
+- `Critique.txt` - raw critic output
+- `Critique_Structured.json` - parsed `A/B/C/D` categories
+- `tailored_resumes/<role>_<date>.docx` - Word artifact
+
+## Profile Facts
+
+If `profile_facts.yaml` exists in repo root, it is auto-loaded.
+You can also set a custom path:
+
+```bash
+python resume_agent.py --profile-facts path/to/profile_facts.yaml ...
+```

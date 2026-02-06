@@ -11,11 +11,14 @@ By default:
 """
 
 import argparse
+import json
 import os
 import re
 import sys
 import time
 import threading
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -24,9 +27,22 @@ from google import genai
 from google.genai import types
 import pypdf
 from docx import Document
-from docx.shared import Pt, Inches
+from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import datetime
+
+from resume_core import (
+    build_critic_prompt,
+    check_for_markdown as core_check_for_markdown,
+    enforce_plain_text as core_enforce_plain_text,
+    extract_length_constraint as core_extract_length_constraint,
+    extract_readable_text_from_html,
+    extract_role_from_jd_filename as core_extract_role_from_jd_filename,
+    format_profile_facts_for_prompt,
+    has_blocking_critic_issues,
+    load_profile_facts,
+    parse_structured_critic,
+)
 
 # === CONFIGURATION ===
 MODEL_NAME = "gemini-3-pro-preview"
@@ -35,6 +51,7 @@ DEFAULT_RESUME = WORKSPACE_DIR / "Yifei-Lian-Resume-merged.pdf"
 JD_FOLDER = WORKSPACE_DIR / "JD"
 TAILORED_RESUMES_FOLDER = WORKSPACE_DIR / "tailored_resumes"
 APPLICATION_RESPONSES_FOLDER = WORKSPACE_DIR / "application_question_response"
+DEFAULT_PROFILE_FACTS = WORKSPACE_DIR / "profile_facts.yaml"
 MAX_RETRIES = 4
 RETRY_BASE_SECONDS = 2
 RETRY_MAX_SECONDS = 20
@@ -180,14 +197,27 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Defaults:
+  --jd-url      Optional URL input; if fetch fails, paste text interactively
+  --jd-text     Direct JD text input (highest priority)
   --jd-pdf      Latest PDF from {JD_FOLDER}
   --resume-pdf  {DEFAULT_RESUME}
+  --profile-facts  {DEFAULT_PROFILE_FACTS} (if file exists)
 """,
+    )
+    parser.add_argument(
+        "--jd-url",
+        required=False,
+        help="Job description URL (HTML fetch with fallback to pasted text)",
+    )
+    parser.add_argument(
+        "--jd-text",
+        required=False,
+        help="Direct job description text input",
     )
     parser.add_argument(
         "--jd-pdf",
         required=False,
-        help="Path to the job description PDF (default: latest from JD folder)",
+        help="Path to the job description PDF (fallback when URL/text not provided)",
     )
     parser.add_argument(
         "--resume-pdf",
@@ -198,7 +228,59 @@ Defaults:
         "--api-key",
         help="Gemini API key (overrides GEMINI_API_KEY env var)",
     )
+    parser.add_argument(
+        "--profile-facts",
+        required=False,
+        help="Path to profile facts YAML (default: profile_facts.yaml if present)",
+    )
     return parser.parse_args()
+
+
+def fetch_jd_text_from_url(url: str, timeout_seconds: int = 15) -> str:
+    """Fetch a JD page and extract readable text."""
+    request = Request(
+        url,
+        headers={"User-Agent": "resume-optimizer/1.0 (+https://local.cli)"},
+    )
+    with urlopen(request, timeout=timeout_seconds) as response:
+        html_bytes = response.read()
+
+    html = html_bytes.decode("utf-8", errors="replace")
+    text = extract_readable_text_from_html(html)
+    if len(text) < 80:
+        raise ValueError("Fetched page did not contain enough readable JD text.")
+    return text
+
+
+def prompt_for_jd_text() -> str:
+    """Prompt the user to paste JD text when URL fetch fails."""
+    print("\n" + "=" * 60)
+    print("=== JD TEXT INPUT REQUIRED ===")
+    print("=" * 60)
+    print("Paste the job description text. Submit with an empty line.")
+    print("-" * 40)
+    lines: list[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line == "":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def infer_role_name(jd_path: Path | None, jd_url: str | None) -> str:
+    """Infer role name from JD filename, URL path, or fallback label."""
+    if jd_path is not None:
+        return core_extract_role_from_jd_filename(jd_path)
+    if jd_url:
+        parsed = urlparse(jd_url)
+        candidate = Path(parsed.path).stem.replace("-", " ").replace("_", " ").strip()
+        if candidate:
+            return re.sub(r"\s+", " ", candidate)
+    return "Tailored Resume"
 
 
 def get_api_key(cli_key: str | None) -> str:
@@ -230,7 +312,7 @@ def validate_pdf_path(path: Path, label: str) -> Path:
     return path
 
 
-def extract_text_from_pdf(path: Path) -> str:
+def extract_text_from_pdf(path: Path) -> str | None:
     """Extract text content from a PDF file."""
     try:
         reader = pypdf.PdfReader(path)
@@ -255,20 +337,8 @@ def load_pdf_content(path: Path) -> str | types.Part:
 
 
 def check_for_markdown(text: str) -> list[str]:
-    """Check for markdown-like patterns in text. Returns list of warnings."""
-    warnings = []
-    lines = text.split("\n")
-    
-    for i, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if re.match(r"^#{1,6}\s", stripped):
-            warnings.append(f"Line {i}: Markdown heading detected (starts with #)")
-        if stripped.startswith("```"):
-            warnings.append(f"Line {i}: Code block marker detected (```)")
-        if re.search(r"\*\*[^*]+\*\*", stripped) or re.search(r"__[^_]+__", stripped):
-            warnings.append(f"Line {i}: Bold markdown detected (**text** or __text__)")
-    
-    return warnings
+    """Wrapper for core markdown detection."""
+    return core_check_for_markdown(text)
 
 
 def send_with_retry(chat: object, message: object, label: str) -> object:
@@ -301,10 +371,11 @@ def run_architect_draft(
     client: genai.Client,
     jd_content: str | types.Part,
     resume_content: str | types.Part,
+    profile_facts_text: str,
 ) -> tuple[object, str]:
     """Run the Architect agent to create initial draft. Returns (chat, draft_text)."""
     
-    draft_prompt = """<context>
+    draft_prompt = f"""<context>
 
 You will receive two inputs:
 
@@ -315,6 +386,10 @@ You will receive two inputs:
 
 
 Each resume includes only real, previously written content about my academic, project, and internship experience. No fictional elements are allowed.
+
+Stable profile facts are provided below and should be treated as authoritative:
+
+{profile_facts_text}
 
 
 
@@ -395,38 +470,12 @@ Output in PLAIN TEXT format only - no markdown syntax.
     )
     
     response = send_with_retry(chat, [jd_content, resume_content, draft_prompt], "Architect draft")
-    
-    return chat, response.text
+    return chat, core_enforce_plain_text(response.text)
 
 
-def run_critic(client: genai.Client, draft_resume: str) -> str:
+def run_critic(client: genai.Client, draft_resume: str, profile_facts_text: str) -> str:
     """Run the Critic agent to brutally evaluate the draft resume."""
-    
-    critic_prompt = f"""RESUME TO EVALUATE:
-
-{draft_resume}
-
----
-
-Evaluate this resume from the perspective of a top-tier recruiting expert. Your task:
-
-- Provide 5 real and brutally honest reasons why this resume would fail screening
-
-- Explain the cause and consequence of each issue
-
-- Provide concrete and actionable directions for improvement
-
-If additional information is required to improve the resume:
-
-- Explicitly state what is missing
-
-- Explain why it is necessary
-
-! No flattery. No reassurance. No agreement.
-
-Facts, logic, and judgment only.
-
-Output in PLAIN TEXT format only - no markdown syntax."""
+    critic_prompt = build_critic_prompt(draft_resume, profile_facts_text)
 
     chat = client.chats.create(
         model=MODEL_NAME,
@@ -438,13 +487,14 @@ Output in PLAIN TEXT format only - no markdown syntax."""
     )
     
     response = send_with_retry(chat, critic_prompt, "Critic review")
-    return response.text
+    return core_enforce_plain_text(response.text)
 
 
 def run_architect_final(
     architect_chat: object,
     critique: str,
     human_input: str,
+    profile_facts_text: str,
 ) -> str:
     """Run the Architect agent to produce final resume incorporating feedback."""
     
@@ -482,12 +532,15 @@ Rules:
 - Do NOT soften issues
 
 - Avoid vague or generic phrasing
+ 
+PROFILE FACTS (authoritative):
+{profile_facts_text}
 {additional_info_section}
 
 Output ONLY the final resume in PLAIN TEXT format - no markdown syntax, no explanations, no preamble."""
 
     response = send_with_retry(architect_chat, final_prompt, "Architect final")
-    return response.text
+    return core_enforce_plain_text(response.text)
 
 
 def get_human_input() -> str:
@@ -500,17 +553,17 @@ def get_human_input() -> str:
     print("(Press Enter twice to submit, or just Enter to skip)")
     print("-" * 40)
     
-    lines = []
+    lines: list[str] = []
     empty_count = 0
     
     try:
         while True:
             line = input()
             if line == "":
-                empty_count += 1
-                if empty_count >= 1 and not lines:
+                if not lines:
                     break
-                if empty_count >= 1 and lines:
+                empty_count += 1
+                if empty_count >= 2:
                     break
                 lines.append("")
             else:
@@ -530,16 +583,8 @@ def save_output(filename: str, content: str) -> None:
 
 
 def extract_role_from_jd_filename(jd_path: Path) -> str:
-    """Extract a clean role name from the JD filename."""
-    # Remove extension and common suffixes
-    name = jd_path.stem
-    # Remove common suffixes like _Job_Description, -JD, etc.
-    for suffix in ["_Job_Description", "_JD", "-JD", "_job_description", " Job Description"]:
-        name = name.replace(suffix, "")
-    # Replace underscores and multiple spaces with single space
-    name = re.sub(r"[_-]+", " ", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name
+    """Wrapper for core role extraction."""
+    return core_extract_role_from_jd_filename(jd_path)
 
 
 def save_resume_as_word(content: str, role_name: str) -> Path:
@@ -557,7 +602,7 @@ def save_resume_as_word(content: str, role_name: str) -> Path:
     
     # Parse and add content
     lines = content.split('\n')
-    for line in lines:
+    for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped:
             # Empty line - add paragraph break
@@ -571,12 +616,12 @@ def save_resume_as_word(content: str, role_name: str) -> Path:
         elif stripped.startswith('- '):
             # Bullet point
             doc.add_paragraph(stripped[2:], style='List Bullet')
-        elif '|' in stripped and lines.index(line) < 5:
+        elif '|' in stripped and idx < 5:
             # Contact info line (name/email/phone)
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = p.add_run(stripped)
-            if lines.index(line) == 0 or (len(stripped) > 10 and stripped[0].isupper()):
+            if idx == 0 or (len(stripped) > 10 and stripped[0].isupper()):
                 run.bold = True
                 run.font.size = Pt(14)
         else:
@@ -626,59 +671,8 @@ def get_application_questions() -> list[str]:
 
 
 def extract_length_constraint(question: str) -> str:
-    """
-    Extract length constraints from a question.
-    Returns a specific constraint string or default.
-    
-    Examples detected:
-    - "in two sentences" -> "exactly 2 sentences"
-    - "in 100 words" -> "approximately 100 words"
-    - "max 200 characters" -> "maximum 200 characters"
-    - "in one paragraph" -> "exactly 1 paragraph"
-    - "briefly describe" -> "2-3 sentences (brief)"
-    """
-    q_lower = question.lower()
-    
-    # Pattern: "in X sentence(s)" or "X sentence(s)"
-    sentence_match = re.search(r'(?:in\s+)?(\d+|one|two|three|four|five)\s+sentences?', q_lower)
-    if sentence_match:
-        num = sentence_match.group(1)
-        num_map = {'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5'}
-        num = num_map.get(num, num)
-        return f"exactly {num} sentence(s)"
-    
-    # Pattern: "in X words" or "max/maximum X words" or "under X words"
-    word_match = re.search(r'(?:in\s+|max(?:imum)?\s+|under\s+|within\s+)?(\d+)\s+words?', q_lower)
-    if word_match:
-        num = word_match.group(1)
-        if 'max' in q_lower or 'under' in q_lower:
-            return f"maximum {num} words"
-        return f"approximately {num} words"
-    
-    # Pattern: "X characters" or "max X characters"
-    char_match = re.search(r'(?:max(?:imum)?\s+|under\s+)?(\d+)\s+characters?', q_lower)
-    if char_match:
-        num = char_match.group(1)
-        return f"maximum {num} characters"
-    
-    # Pattern: "in X paragraph(s)" or "one paragraph"
-    para_match = re.search(r'(?:in\s+)?(\d+|one|two|three)\s+paragraphs?', q_lower)
-    if para_match:
-        num = para_match.group(1)
-        num_map = {'one': '1', 'two': '2', 'three': '3'}
-        num = num_map.get(num, num)
-        return f"exactly {num} paragraph(s)"
-    
-    # Pattern: "briefly" or "brief"
-    if re.search(r'\bbrief(?:ly)?\b', q_lower):
-        return "2-3 sentences (keep it brief)"
-    
-    # Pattern: "concise" or "concisely"
-    if re.search(r'\bconcise(?:ly)?\b', q_lower):
-        return "3-4 sentences (be concise)"
-    
-    # Default
-    return "max 2 short paragraphs"
+    """Wrapper for core length-constraint extraction."""
+    return core_extract_length_constraint(question)
 
 
 def run_application_response(
@@ -731,7 +725,7 @@ RESUME:
         ),
     )
     
-    return response.text
+    return core_enforce_plain_text(response.text)
 
 
 def save_application_responses(content: str, role_name: str) -> Path:
@@ -770,38 +764,83 @@ def main() -> None:
     # Get and validate API key
     api_key = get_api_key(args.api_key)
     
-    # Resolve JD path
-    if args.jd_pdf:
-        jd_path = Path(args.jd_pdf)
-    else:
-        jd_path = get_latest_jd_pdf()
-        if jd_path is None:
-            print(f"ERROR: No PDF files found in JD folder: {JD_FOLDER}", file=sys.stderr)
-            print("Either add a JD PDF to the folder or use --jd-pdf argument.", file=sys.stderr)
-            sys.exit(1)
-        print(f"Auto-detected latest JD: {jd_path.name}")
-    
     # Resolve resume path
     if args.resume_pdf:
         resume_path = Path(args.resume_pdf)
     else:
         resume_path = DEFAULT_RESUME
         print(f"Using default resume: {resume_path.name}")
-    
-    # Validate paths
-    jd_path = validate_pdf_path(jd_path, "Job Description")
+
+    # Resolve profile facts
+    profile_facts_path: Path | None = None
+    if args.profile_facts:
+        profile_facts_path = Path(args.profile_facts)
+        if not profile_facts_path.exists():
+            print(f"ERROR: --profile-facts file not found: {profile_facts_path}", file=sys.stderr)
+            sys.exit(1)
+    elif DEFAULT_PROFILE_FACTS.exists():
+        profile_facts_path = DEFAULT_PROFILE_FACTS
+
+    try:
+        profile_facts = load_profile_facts(profile_facts_path)
+    except Exception as e:
+        print(f"ERROR: Failed to load profile facts: {e}", file=sys.stderr)
+        sys.exit(1)
+    profile_facts_text = format_profile_facts_for_prompt(profile_facts)
+
+    jd_path: Path | None = None
+    jd_content: str | types.Part
+    jd_label: str
+
+    if args.jd_text and args.jd_text.strip():
+        jd_label = "inline --jd-text"
+        jd_content = f"--- JOB DESCRIPTION (inline text) ---\n{args.jd_text.strip()}\n--- END JOB DESCRIPTION ---\n"
+    elif args.jd_url:
+        jd_label = args.jd_url
+        try:
+            with timed_section("JD URL fetch"):
+                fetched_jd_text = fetch_jd_text_from_url(args.jd_url)
+            jd_content = f"--- JOB DESCRIPTION ({args.jd_url}) ---\n{fetched_jd_text}\n--- END JOB DESCRIPTION ---\n"
+        except Exception as e:
+            print(f"WARNING: JD URL fetch failed: {e}", file=sys.stderr)
+            pasted = prompt_for_jd_text()
+            if not pasted:
+                print("ERROR: No pasted JD text provided after URL fetch failure.", file=sys.stderr)
+                sys.exit(1)
+            jd_label = f"{args.jd_url} (fallback pasted text)"
+            jd_content = f"--- JOB DESCRIPTION (pasted text) ---\n{pasted}\n--- END JOB DESCRIPTION ---\n"
+    else:
+        if args.jd_pdf:
+            jd_path = Path(args.jd_pdf)
+        else:
+            jd_path = get_latest_jd_pdf()
+            if jd_path is None:
+                print(f"ERROR: No PDF files found in JD folder: {JD_FOLDER}", file=sys.stderr)
+                print("Provide --jd-url/--jd-text or add a JD PDF.", file=sys.stderr)
+                sys.exit(1)
+            print(f"Auto-detected latest JD: {jd_path.name}")
+        jd_path = validate_pdf_path(jd_path, "Job Description")
+        jd_label = str(jd_path)
+
+    # Validate resume path
     resume_path = validate_pdf_path(resume_path, "Resume")
     
     print("-" * 60)
-    print(f"Job Description: {jd_path}")
+    print(f"Job Description: {jd_label}")
     print(f"Resume: {resume_path}")
+    print(f"Profile Facts: {profile_facts_path if profile_facts_path else '[none]'}")
     print(f"Model: {MODEL_NAME}")
     print("-" * 60)
     
-    # Load PDFs in PARALLEL (optimized)
-    print("Loading PDF files (parallel extraction)...")
-    with timed_section("PDF extraction"):
-        jd_content, resume_content = parallel_extract_pdfs(jd_path, resume_path)
+    # Load inputs
+    if jd_path is not None:
+        print("Loading PDF files (parallel extraction)...")
+        with timed_section("PDF extraction"):
+            jd_content, resume_content = parallel_extract_pdfs(jd_path, resume_path)
+    else:
+        print("Loading resume PDF...")
+        with timed_section("Resume extraction"):
+            resume_content = load_pdf_content(resume_path)
     
     # Initialize Gemini client
     try:
@@ -814,7 +853,12 @@ def main() -> None:
     print("\n[Phase 1/4] Architect creating initial draft...")
     with Spinner("Gemini drafting resume"), timed_section("Architect Draft API"):
         try:
-            architect_chat, draft_response = run_architect_draft(client, jd_content, resume_content)
+            architect_chat, draft_response = run_architect_draft(
+                client,
+                jd_content,
+                resume_content,
+                profile_facts_text,
+            )
         except Exception as e:
             error_msg = str(e).lower()
             if "api key" in error_msg or "authentication" in error_msg or "401" in error_msg:
@@ -844,7 +888,7 @@ def main() -> None:
     print("\n[Phase 2/4] Critic performing brutal review...")
     with Spinner("Critic analyzing draft"), timed_section("Critic Review API"):
         try:
-            critique = run_critic(client, draft_response)
+            critique = run_critic(client, draft_response, profile_facts_text)
         except Exception as e:
             print(f"ERROR: Critic API call failed: {e}", file=sys.stderr)
             sys.exit(1)
@@ -853,19 +897,32 @@ def main() -> None:
     
     # Save critique
     save_output("Critique.txt", critique)
+
+    parsed_critique = parse_structured_critic(critique)
+    save_output("Critique_Structured.json", json.dumps(parsed_critique, indent=2))
     
     # === PHASE 3: Human Input ===
-    human_input = get_human_input()
-    if human_input:
-        print(f"\nReceived clarifications ({len(human_input)} chars)")
+    if has_blocking_critic_issues(parsed_critique):
+        print("\nCritic reported blocking user-input issues (Section A).")
+        human_input = get_human_input()
+        if human_input:
+            print(f"\nReceived clarifications ({len(human_input)} chars)")
+        else:
+            print("\nNo clarifications provided; proceeding with available facts.")
     else:
-        print("\nNo clarifications provided, proceeding with critique only.")
+        human_input = ""
+        print("\nNo blocking user-input issues in structured critique; skipping manual pause.")
     
     # === PHASE 4: Final Resume ===
     print("\n[Phase 4/4] Architect producing final resume...")
     with Spinner("Gemini finalizing resume"), timed_section("Architect Final API"):
         try:
-            final_resume = run_architect_final(architect_chat, critique, human_input)
+            final_resume = run_architect_final(
+                architect_chat,
+                critique,
+                human_input,
+                profile_facts_text,
+            )
         except Exception as e:
             print(f"ERROR: Final resume API call failed: {e}", file=sys.stderr)
             sys.exit(1)
@@ -886,7 +943,7 @@ def main() -> None:
     # === PHASE 5: Convert to Word and save to tailored_resumes folder ===
     print("\n[Phase 5/6] Converting to Word format...")
     with timed_section("Word conversion"):
-        role_name = extract_role_from_jd_filename(jd_path)
+        role_name = infer_role_name(jd_path, args.jd_url)
         word_path = save_resume_as_word(final_resume, role_name)
     
     # === PHASE 6: Application Question Responses ===
@@ -898,8 +955,13 @@ def main() -> None:
         print(f"\nGenerating responses for {len(questions)} question(s)...")
         with Spinner("Crafting responses"), timed_section("Application Responses API"):
             try:
-                # Use text content for JD if it was extracted
-                jd_text = jd_content if isinstance(jd_content, str) else "[JD content from PDF]"
+                # Use extracted text where available; fallback only when binary JD part was used.
+                if isinstance(jd_content, str):
+                    jd_text = jd_content
+                elif jd_path is not None:
+                    jd_text = extract_text_from_pdf(jd_path) or "[JD content from PDF]"
+                else:
+                    jd_text = "[JD content unavailable]"
                 responses = run_application_response(client, jd_text, final_resume, questions)
             except Exception as e:
                 print(f"ERROR: Failed to generate responses: {e}", file=sys.stderr)

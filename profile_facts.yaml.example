@@ -1,0 +1,12 @@
+name: Your Name
+location: City, Country
+contact:
+  phone: "+1 ..."
+  email: "you@example.com"
+  github: "github.com/yourhandle"
+education:
+  current_program: "MSc ..."
+  graduation_window: "Expected 2026"
+availability: "Immediate"
+notes:
+  - "Only use facts that are present in resume source materials."
