@@ -18,6 +18,10 @@ import sys
 import time
 import threading
 from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 from urllib.request import Request, urlopen
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -68,17 +72,29 @@ def timed_section(name: str):
 
 class Spinner:
     """Minimal CLI spinner for long-running operations."""
-    FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    UNICODE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    ASCII_FRAMES = ["-", "\\", "|", "/"]
     
     def __init__(self, message: str = "Processing"):
         self.message = message
         self._stop_event = threading.Event()
         self._thread = None
+        self.frames = self._resolve_frames()
+
+    def _resolve_frames(self) -> list[str]:
+        """Choose spinner frames compatible with current stdout encoding."""
+        encoding = sys.stdout.encoding or "utf-8"
+        try:
+            for frame in self.UNICODE_FRAMES:
+                frame.encode(encoding)
+            return self.UNICODE_FRAMES
+        except (LookupError, UnicodeEncodeError):
+            return self.ASCII_FRAMES
     
     def _spin(self):
         idx = 0
         while not self._stop_event.is_set():
-            frame = self.FRAMES[idx % len(self.FRAMES)]
+            frame = self.frames[idx % len(self.frames)]
             print(f"\r  {frame} {self.message}...", end="", flush=True)
             idx += 1
             time.sleep(0.1)
@@ -236,20 +252,125 @@ Defaults:
     return parser.parse_args()
 
 
-def fetch_jd_text_from_url(url: str, timeout_seconds: int = 15) -> str:
-    """Fetch a JD page and extract readable text."""
+def _canonicalize_url_for_match(url: str) -> tuple[str, str]:
+    """Return (host, normalized_path) for robust URL matching."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = re.sub(r"/{2,}", "/", parsed.path).rstrip("/").lower()
+    return host, path
+
+
+def _extract_ashby_job_text_via_posting_api(job_url: str, timeout_seconds: int = 15) -> str:
+    """Fetch JD text for Ashby-hosted jobs via public posting API."""
+    parsed = urlparse(job_url)
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if len(segments) < 2:
+        raise ValueError("Ashby URL format not recognized.")
+
+    job_board_name = segments[0]
+    target_slug = segments[-1].lower()
+    api_url = f"https://api.ashbyhq.com/posting-api/job-board/{job_board_name}"
+
     request = Request(
-        url,
-        headers={"User-Agent": "resume-optimizer/1.0 (+https://local.cli)"},
+        api_url,
+        headers={
+            "User-Agent": "resume-optimizer/1.0 (+https://local.cli)",
+            "Accept": "application/json",
+        },
     )
     with urlopen(request, timeout=timeout_seconds) as response:
-        html_bytes = response.read()
+        data = json.loads(response.read().decode("utf-8", errors="replace"))
 
-    html = html_bytes.decode("utf-8", errors="replace")
-    text = extract_readable_text_from_html(html)
-    if len(text) < 80:
-        raise ValueError("Fetched page did not contain enough readable JD text.")
-    return text
+    jobs = data.get("jobs")
+    if not isinstance(jobs, list) or not jobs:
+        raise ValueError(f"No jobs found from Ashby posting API for board '{job_board_name}'.")
+
+    target_host, target_path = _canonicalize_url_for_match(job_url)
+    matched_job: dict | None = None
+    fallback_match: dict | None = None
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        for key in ("jobUrl", "applyUrl"):
+            candidate_url = job.get(key)
+            if not isinstance(candidate_url, str) or not candidate_url.strip():
+                continue
+            candidate_host, candidate_path = _canonicalize_url_for_match(candidate_url)
+            candidate_segments = [segment for segment in candidate_path.split("/") if segment]
+            if candidate_host == target_host and candidate_path == target_path:
+                matched_job = job
+                break
+            if target_slug in candidate_segments:
+                fallback_match = fallback_match or job
+        if matched_job is not None:
+            break
+    if matched_job is None:
+        matched_job = fallback_match
+    if matched_job is None:
+        raise ValueError("Could not match target job URL in Ashby posting API response.")
+
+    description_plain = matched_job.get("descriptionPlain")
+    if isinstance(description_plain, str):
+        description_text = description_plain.strip()
+    else:
+        description_text = ""
+
+    if len(description_text) < 80:
+        description_html = matched_job.get("descriptionHtml")
+        if isinstance(description_html, str):
+            description_text = extract_readable_text_from_html(description_html).strip()
+
+    if len(description_text) < 80:
+        raise ValueError("Ashby posting API returned insufficient JD description text.")
+
+    details: list[str] = []
+    for field, label in (
+        ("title", "Title"),
+        ("location", "Location"),
+        ("department", "Department"),
+        ("team", "Team"),
+        ("employmentType", "Employment Type"),
+    ):
+        value = matched_job.get(field)
+        if isinstance(value, str) and value.strip():
+            details.append(f"{label}: {value.strip()}")
+
+    details.append("")
+    details.append(description_text)
+    return "\n".join(details).strip()
+
+
+def fetch_jd_text_from_url(url: str, timeout_seconds: int = 15) -> str:
+    """Fetch a JD page and extract readable text."""
+    parsed = urlparse(url)
+    ashby_error: Exception | None = None
+
+    if parsed.netloc.lower().endswith("jobs.ashbyhq.com"):
+        try:
+            return _extract_ashby_job_text_via_posting_api(url, timeout_seconds=timeout_seconds)
+        except Exception as e:
+            ashby_error = e
+
+    try:
+        request = Request(
+            url,
+            headers={"User-Agent": "resume-optimizer/1.0 (+https://local.cli)"},
+        )
+        with urlopen(request, timeout=timeout_seconds) as response:
+            html_bytes = response.read()
+
+        html = html_bytes.decode("utf-8", errors="replace")
+        text = extract_readable_text_from_html(html)
+        if len(text) < 80:
+            raise ValueError("Fetched page did not contain enough readable JD text.")
+        return text
+    except Exception as e:
+        if ashby_error is not None:
+            raise ValueError(
+                "Failed to ingest Ashby JD via both API and HTML fallback. "
+                f"API error: {ashby_error}. HTML error: {e}"
+            ) from e
+        raise
 
 
 def prompt_for_jd_text() -> str:
