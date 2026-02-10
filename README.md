@@ -5,9 +5,11 @@ A CLI tool that optimizes your resume for a target job description using Gemini 
 ## Features
 
 - Phase 0-aligned JD ingestion:
-  - `--jd-url` (fetch HTML and extract text, fallback to pasted text)
+  - Local web paste form (default; terminal fallback)
+  - `--jd-url` (context-only metadata for labeling/role naming; no fetch)
   - `--jd-text` (direct inline JD text)
-  - `--jd-pdf` (existing PDF flow)
+  - `--jd-pdf` (optional PDF alternative)
+  - `--jd-input-mode` (`auto`, `web`, `terminal`)
 - Dual-agent architecture: Architect (writer) and Critic (strict reviewer)
 - Structured Critic categories:
   - `A) Needs user input (blocking)`
@@ -56,10 +58,19 @@ python resume_agent.py --jd-url "<job-posting-url>" --resume-pdf <path-to-your-r
 ### Examples
 
 ```bash
-python resume_agent.py --jd-pdf "JD/VSIM_Job_Description.pdf" --resume-pdf "Yifei-Lian-Resume-merged.pdf"
+python resume_agent.py --resume-pdf "Yifei-Lian-Resume-merged.pdf"
+python resume_agent.py --jd-input-mode terminal --resume-pdf "Yifei-Lian-Resume-merged.pdf"
 python resume_agent.py --jd-text "We are hiring a robotics ML engineer..." --resume-pdf "Yifei-Lian-Resume-merged.pdf"
-python resume_agent.py --jd-url "https://example.com/job/123" --resume-pdf "Yifei-Lian-Resume-merged.pdf"
+python resume_agent.py --jd-pdf "JD/VSIM_Job_Description.pdf" --resume-pdf "Yifei-Lian-Resume-merged.pdf"
+python resume_agent.py --jd-url "https://jobs.gem.com/..." --resume-pdf "Yifei-Lian-Resume-merged.pdf"
 ```
+
+### JD Input UX
+
+- Default behavior opens a temporary local web page (`127.0.0.1`) with a large textarea for multi-line paste.
+- Empty lines are preserved in web mode.
+- If web mode is unavailable (or times out in `auto` mode), the script falls back to terminal mode.
+- Terminal mode uses an explicit end marker: type `END_JD` on its own line to submit.
 
 ## Workflow
 

@@ -3,26 +3,29 @@
 Resume Tailoring Agent - Optimizes resumes for target job descriptions using Gemini.
 
 Usage:
-    python resume_agent.py [--jd-pdf JD.pdf] [--resume-pdf Resume.pdf] [--api-key KEY]
+    python resume_agent.py [--jd-text "..."] [--jd-pdf JD.pdf] [--resume-pdf Resume.pdf] [--api-key KEY]
 
 By default:
-    - JD: fetches the latest PDF from ./JD folder (by creation time)
+    - JD: prompts for pasted text using a local web form (terminal fallback available)
     - Resume: uses ./Yifei-Lian-Resume-merged.pdf
 """
 
 import argparse
+import html
 import json
 import os
 import re
 import sys
 import time
 import threading
-from urllib.parse import urlparse
+import webbrowser
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
-from urllib.request import Request, urlopen
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -40,7 +43,6 @@ from resume_core import (
     check_for_markdown as core_check_for_markdown,
     enforce_plain_text as core_enforce_plain_text,
     extract_length_constraint as core_extract_length_constraint,
-    extract_readable_text_from_html,
     extract_role_from_jd_filename as core_extract_role_from_jd_filename,
     format_profile_facts_for_prompt,
     has_blocking_critic_issues,
@@ -52,13 +54,15 @@ from resume_core import (
 MODEL_NAME = "gemini-3-pro-preview"
 WORKSPACE_DIR = Path(__file__).parent.resolve()
 DEFAULT_RESUME = WORKSPACE_DIR / "Yifei-Lian-Resume-merged.pdf"
-JD_FOLDER = WORKSPACE_DIR / "JD"
 TAILORED_RESUMES_FOLDER = WORKSPACE_DIR / "tailored_resumes"
 APPLICATION_RESPONSES_FOLDER = WORKSPACE_DIR / "application_question_response"
 DEFAULT_PROFILE_FACTS = WORKSPACE_DIR / "profile_facts.yaml"
 MAX_RETRIES = 4
 RETRY_BASE_SECONDS = 2
 RETRY_MAX_SECONDS = 20
+JD_WEB_INPUT_TIMEOUT_SECONDS = 15 * 60
+JD_TERMINAL_END_MARKER = "END_JD"
+LOOPBACK_PROXY_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 # === PERFORMANCE UTILITIES ===
 @contextmanager
@@ -192,20 +196,6 @@ Structure your response as follows:
 </output_format>"""
 
 
-def get_latest_jd_pdf() -> Path | None:
-    """Find the most recently created PDF in the JD folder."""
-    if not JD_FOLDER.exists():
-        return None
-    
-    pdf_files = list(JD_FOLDER.glob("*.pdf"))
-    if not pdf_files:
-        return None
-    
-    # Sort by creation time (st_ctime), most recent first
-    latest = max(pdf_files, key=lambda p: p.stat().st_ctime)
-    return latest
-
-
 def parse_args() -> argparse.Namespace:
     """Parse and validate command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -213,9 +203,10 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Defaults:
-  --jd-url      Optional URL input; if fetch fails, paste text interactively
+  --jd-url      Optional context-only URL (no network fetch)
   --jd-text     Direct JD text input (highest priority)
-  --jd-pdf      Latest PDF from {JD_FOLDER}
+  --jd-pdf      JD PDF path (optional alternative to pasted text)
+  --jd-input-mode  auto (web first, then terminal)
   --resume-pdf  {DEFAULT_RESUME}
   --profile-facts  {DEFAULT_PROFILE_FACTS} (if file exists)
 """,
@@ -223,7 +214,7 @@ Defaults:
     parser.add_argument(
         "--jd-url",
         required=False,
-        help="Job description URL (HTML fetch with fallback to pasted text)",
+        help="Optional job URL used only for labeling/role naming (URL fetch removed)",
     )
     parser.add_argument(
         "--jd-text",
@@ -233,11 +224,17 @@ Defaults:
     parser.add_argument(
         "--jd-pdf",
         required=False,
-        help="Path to the job description PDF (fallback when URL/text not provided)",
+        help="Path to the job description PDF (alternative to pasted text)",
+    )
+    parser.add_argument(
+        "--jd-input-mode",
+        choices=("auto", "web", "terminal"),
+        default="auto",
+        help="JD paste input mode when --jd-text/--jd-pdf are not used (default: auto)",
     )
     parser.add_argument(
         "--resume-pdf",
-        required=False,
+        default=str(DEFAULT_RESUME),
         help=f"Path to the merged resume PDF (default: {DEFAULT_RESUME.name})",
     )
     parser.add_argument(
@@ -252,133 +249,190 @@ Defaults:
     return parser.parse_args()
 
 
-def _canonicalize_url_for_match(url: str) -> tuple[str, str]:
-    """Return (host, normalized_path) for robust URL matching."""
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    path = re.sub(r"/{2,}", "/", parsed.path).rstrip("/").lower()
-    return host, path
+def _normalize_pasted_jd_text(raw_text: str) -> str:
+    """Normalize pasted JD text line endings while preserving internal blank lines."""
+    normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.strip()
 
 
-def _extract_ashby_job_text_via_posting_api(job_url: str, timeout_seconds: int = 15) -> str:
-    """Fetch JD text for Ashby-hosted jobs via public posting API."""
-    parsed = urlparse(job_url)
-    segments = [segment for segment in parsed.path.split("/") if segment]
-    if len(segments) < 2:
-        raise ValueError("Ashby URL format not recognized.")
+def _build_jd_input_page(source_url: str | None) -> str:
+    """Build a lightweight local HTML form for JD pasting."""
+    source_url_html = html.escape(source_url) if source_url else "Not provided"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Resume Agent - Paste Job Description</title>
+  <style>
+    :root {{
+      --bg: #f6f4ef;
+      --card: #fffef9;
+      --ink: #1a1f16;
+      --accent: #1f6b4f;
+      --muted: #5f635a;
+      --border: #d9d4c8;
+    }}
+    body {{
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      background: radial-gradient(circle at top right, #e8efe9 0%, var(--bg) 60%);
+      color: var(--ink);
+      line-height: 1.45;
+    }}
+    .wrap {{
+      max-width: 900px;
+      margin: 24px auto;
+      padding: 0 16px;
+    }}
+    .card {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 10px 30px rgba(18, 30, 22, 0.08);
+      padding: 20px;
+    }}
+    h1 {{
+      margin: 0 0 10px;
+      font-size: 1.5rem;
+    }}
+    p {{
+      margin: 0 0 10px;
+      color: var(--muted);
+    }}
+    .meta {{
+      margin: 0 0 16px;
+      padding: 10px 12px;
+      background: #f1f5f0;
+      border-radius: 8px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }}
+    textarea {{
+      width: 100%;
+      min-height: 360px;
+      resize: vertical;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      box-sizing: border-box;
+      font: 14px/1.4 Consolas, "Courier New", monospace;
+      color: #102013;
+      background: #fffffe;
+    }}
+    button {{
+      margin-top: 14px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.95rem;
+    }}
+    button:hover {{
+      filter: brightness(0.95);
+    }}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <h1>Paste Job Description</h1>
+      <p>Paste the full JD as plain text. Empty lines are preserved.</p>
+      <div class="meta">Context URL: {source_url_html}</div>
+      <form method="post" action="/submit">
+        <textarea name="jd_text" placeholder="Paste full JD text here..." required autofocus></textarea>
+        <button type="submit">Use This JD</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>
+"""
 
-    job_board_name = segments[0]
-    target_slug = segments[-1].lower()
-    api_url = f"https://api.ashbyhq.com/posting-api/job-board/{job_board_name}"
 
-    request = Request(
-        api_url,
-        headers={
-            "User-Agent": "resume-optimizer/1.0 (+https://local.cli)",
-            "Accept": "application/json",
-        },
-    )
-    with urlopen(request, timeout=timeout_seconds) as response:
-        data = json.loads(response.read().decode("utf-8", errors="replace"))
+def prompt_for_jd_text_web(source_url: str | None = None, timeout_seconds: int = JD_WEB_INPUT_TIMEOUT_SECONDS) -> str | None:
+    """Collect JD text from a temporary local web form."""
+    page_html = _build_jd_input_page(source_url)
+    submission: dict[str, str | None] = {"text": None}
+    submitted = threading.Event()
 
-    jobs = data.get("jobs")
-    if not isinstance(jobs, list) or not jobs:
-        raise ValueError(f"No jobs found from Ashby posting API for board '{job_board_name}'.")
+    class JDInputHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path not in ("/", "/index.html"):
+                self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+                return
+            payload = page_html.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
 
-    target_host, target_path = _canonicalize_url_for_match(job_url)
-    matched_job: dict | None = None
-    fallback_match: dict | None = None
-    for job in jobs:
-        if not isinstance(job, dict):
-            continue
-        for key in ("jobUrl", "applyUrl"):
-            candidate_url = job.get(key)
-            if not isinstance(candidate_url, str) or not candidate_url.strip():
-                continue
-            candidate_host, candidate_path = _canonicalize_url_for_match(candidate_url)
-            candidate_segments = [segment for segment in candidate_path.split("/") if segment]
-            if candidate_host == target_host and candidate_path == target_path:
-                matched_job = job
-                break
-            if target_slug in candidate_segments:
-                fallback_match = fallback_match or job
-        if matched_job is not None:
-            break
-    if matched_job is None:
-        matched_job = fallback_match
-    if matched_job is None:
-        raise ValueError("Could not match target job URL in Ashby posting API response.")
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path != "/submit":
+                self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+                return
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                content_length = 0
+            raw_body = self.rfile.read(content_length).decode("utf-8", errors="replace")
+            parsed = parse_qs(raw_body, keep_blank_values=True)
+            raw_jd_text = parsed.get("jd_text", [""])[0]
+            submission["text"] = _normalize_pasted_jd_text(raw_jd_text)
+            submitted.set()
 
-    description_plain = matched_job.get("descriptionPlain")
-    if isinstance(description_plain, str):
-        description_text = description_plain.strip()
-    else:
-        description_text = ""
+            done_page = (
+                "<!doctype html><html><body>"
+                "<h2>JD received</h2><p>You can return to the terminal.</p>"
+                "</body></html>"
+            ).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(done_page)))
+            self.end_headers()
+            self.wfile.write(done_page)
 
-    if len(description_text) < 80:
-        description_html = matched_job.get("descriptionHtml")
-        if isinstance(description_html, str):
-            description_text = extract_readable_text_from_html(description_html).strip()
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+            return
 
-    if len(description_text) < 80:
-        raise ValueError("Ashby posting API returned insufficient JD description text.")
-
-    details: list[str] = []
-    for field, label in (
-        ("title", "Title"),
-        ("location", "Location"),
-        ("department", "Department"),
-        ("team", "Team"),
-        ("employmentType", "Employment Type"),
-    ):
-        value = matched_job.get(field)
-        if isinstance(value, str) and value.strip():
-            details.append(f"{label}: {value.strip()}")
-
-    details.append("")
-    details.append(description_text)
-    return "\n".join(details).strip()
-
-
-def fetch_jd_text_from_url(url: str, timeout_seconds: int = 15) -> str:
-    """Fetch a JD page and extract readable text."""
-    parsed = urlparse(url)
-    ashby_error: Exception | None = None
-
-    if parsed.netloc.lower().endswith("jobs.ashbyhq.com"):
-        try:
-            return _extract_ashby_job_text_via_posting_api(url, timeout_seconds=timeout_seconds)
-        except Exception as e:
-            ashby_error = e
+    server = ThreadingHTTPServer(("127.0.0.1", 0), JDInputHandler)
+    port = server.server_address[1]
+    ui_url = f"http://127.0.0.1:{port}/"
+    server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
+    server_thread.start()
 
     try:
-        request = Request(
-            url,
-            headers={"User-Agent": "resume-optimizer/1.0 (+https://local.cli)"},
-        )
-        with urlopen(request, timeout=timeout_seconds) as response:
-            html_bytes = response.read()
+        print("\n" + "=" * 60)
+        print("=== JD TEXT INPUT (LOCAL WEB FORM) ===")
+        print("=" * 60)
+        print(f"Open this URL if a browser does not launch automatically:\n{ui_url}")
+        print(f"Waiting up to {timeout_seconds} seconds for submission...")
+        try:
+            webbrowser.open(ui_url, new=1)
+        except Exception:
+            pass
 
-        html = html_bytes.decode("utf-8", errors="replace")
-        text = extract_readable_text_from_html(html)
-        if len(text) < 80:
-            raise ValueError("Fetched page did not contain enough readable JD text.")
-        return text
-    except Exception as e:
-        if ashby_error is not None:
-            raise ValueError(
-                "Failed to ingest Ashby JD via both API and HTML fallback. "
-                f"API error: {ashby_error}. HTML error: {e}"
-            ) from e
-        raise
+        if not submitted.wait(timeout_seconds):
+            return None
+        return submission["text"] or ""
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1)
 
 
-def prompt_for_jd_text() -> str:
-    """Prompt the user to paste JD text when URL fetch fails."""
+def prompt_for_jd_text_terminal(end_marker: str = JD_TERMINAL_END_MARKER) -> str:
+    """Prompt for multiline JD text in terminal with an explicit end marker."""
     print("\n" + "=" * 60)
     print("=== JD TEXT INPUT REQUIRED ===")
     print("=" * 60)
-    print("Paste the job description text. Submit with an empty line.")
+    print("Paste the job description text below.")
+    print(f"Submit by entering a line with only: {end_marker}")
     print("-" * 40)
     lines: list[str] = []
     while True:
@@ -386,10 +440,29 @@ def prompt_for_jd_text() -> str:
             line = input()
         except EOFError:
             break
-        if line == "":
+        if line.strip() == end_marker:
             break
         lines.append(line)
-    return "\n".join(lines).strip()
+    return _normalize_pasted_jd_text("\n".join(lines))
+
+
+def prompt_for_jd_text(input_mode: str, source_url: str | None = None) -> str:
+    """Collect JD text using web/terminal mode with robust fallback behavior."""
+    if input_mode not in {"auto", "web", "terminal"}:
+        raise ValueError(f"Unsupported JD input mode: {input_mode}")
+
+    if input_mode in {"auto", "web"}:
+        pasted = prompt_for_jd_text_web(source_url=source_url)
+        if pasted:
+            return pasted
+        if input_mode == "web":
+            return ""
+        print(
+            "WARNING: Web input was unavailable or timed out. Falling back to terminal input.",
+            file=sys.stderr,
+        )
+
+    return prompt_for_jd_text_terminal()
 
 
 def infer_role_name(jd_path: Path | None, jd_url: str | None) -> str:
@@ -408,12 +481,58 @@ def get_api_key(cli_key: str | None) -> str:
     """Get API key from CLI arg or environment variable."""
     if cli_key:
         return cli_key
-    env_key = os.environ.get("GEMINI_API_KEY")
+    env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if env_key:
         return env_key
     print("ERROR: No API key provided.", file=sys.stderr)
-    print("Set GEMINI_API_KEY environment variable or use --api-key argument.", file=sys.stderr)
+    print("Set GEMINI_API_KEY/GOOGLE_API_KEY or use --api-key argument.", file=sys.stderr)
     sys.exit(1)
+
+
+def _proxy_targets_loopback(proxy_value: str) -> bool:
+    """Return True when a proxy URL resolves to a loopback host."""
+    value = proxy_value.strip()
+    if not value:
+        return False
+    if "://" not in value:
+        value = f"http://{value}"
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    return host in LOOPBACK_PROXY_HOSTS
+
+
+def sanitize_proxy_env_for_gemini() -> None:
+    """
+    Clear broken loopback proxy env vars for this process.
+
+    This avoids connection-refused failures when global shell proxy settings are set
+    to a non-running local endpoint (for example, 127.0.0.1:9).
+    """
+    if os.environ.get("RESUME_AGENT_ALLOW_LOOPBACK_PROXY") == "1":
+        return
+
+    proxy_keys = (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    )
+    removed: list[str] = []
+    for key in proxy_keys:
+        value = os.environ.get(key)
+        if value and _proxy_targets_loopback(value):
+            removed.append(f"{key}={value}")
+            os.environ.pop(key, None)
+
+    if removed:
+        print(
+            "WARNING: Ignoring loopback proxy env vars for Gemini API calls in this run:",
+            file=sys.stderr,
+        )
+        for item in removed:
+            print(f"  - {item}", file=sys.stderr)
 
 
 def validate_pdf_path(path: Path, label: str) -> Path:
@@ -884,12 +1003,11 @@ def main() -> None:
     
     # Get and validate API key
     api_key = get_api_key(args.api_key)
+    sanitize_proxy_env_for_gemini()
     
     # Resolve resume path
-    if args.resume_pdf:
-        resume_path = Path(args.resume_pdf)
-    else:
-        resume_path = DEFAULT_RESUME
+    resume_path = Path(args.resume_pdf)
+    if resume_path.resolve() == DEFAULT_RESUME.resolve():
         print(f"Using default resume: {resume_path.name}")
 
     # Resolve profile facts
@@ -916,32 +1034,24 @@ def main() -> None:
     if args.jd_text and args.jd_text.strip():
         jd_label = "inline --jd-text"
         jd_content = f"--- JOB DESCRIPTION (inline text) ---\n{args.jd_text.strip()}\n--- END JOB DESCRIPTION ---\n"
-    elif args.jd_url:
-        jd_label = args.jd_url
-        try:
-            with timed_section("JD URL fetch"):
-                fetched_jd_text = fetch_jd_text_from_url(args.jd_url)
-            jd_content = f"--- JOB DESCRIPTION ({args.jd_url}) ---\n{fetched_jd_text}\n--- END JOB DESCRIPTION ---\n"
-        except Exception as e:
-            print(f"WARNING: JD URL fetch failed: {e}", file=sys.stderr)
-            pasted = prompt_for_jd_text()
-            if not pasted:
-                print("ERROR: No pasted JD text provided after URL fetch failure.", file=sys.stderr)
-                sys.exit(1)
-            jd_label = f"{args.jd_url} (fallback pasted text)"
-            jd_content = f"--- JOB DESCRIPTION (pasted text) ---\n{pasted}\n--- END JOB DESCRIPTION ---\n"
-    else:
-        if args.jd_pdf:
-            jd_path = Path(args.jd_pdf)
-        else:
-            jd_path = get_latest_jd_pdf()
-            if jd_path is None:
-                print(f"ERROR: No PDF files found in JD folder: {JD_FOLDER}", file=sys.stderr)
-                print("Provide --jd-url/--jd-text or add a JD PDF.", file=sys.stderr)
-                sys.exit(1)
-            print(f"Auto-detected latest JD: {jd_path.name}")
+    elif args.jd_pdf:
+        jd_path = Path(args.jd_pdf)
         jd_path = validate_pdf_path(jd_path, "Job Description")
         jd_label = str(jd_path)
+    else:
+        if args.jd_url:
+            print(
+                "INFO: --jd-url is now context-only. JD URL fetching has been removed; please paste JD text.",
+                file=sys.stderr,
+            )
+        pasted = prompt_for_jd_text(input_mode=args.jd_input_mode, source_url=args.jd_url)
+        if not pasted:
+            print("ERROR: No JD text was submitted.", file=sys.stderr)
+            sys.exit(1)
+        jd_label = "pasted text"
+        if args.jd_url:
+            jd_label = f"pasted text ({args.jd_url})"
+        jd_content = f"--- JOB DESCRIPTION (pasted text) ---\n{pasted}\n--- END JOB DESCRIPTION ---\n"
 
     # Validate resume path
     resume_path = validate_pdf_path(resume_path, "Resume")

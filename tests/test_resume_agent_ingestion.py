@@ -1,100 +1,53 @@
-import json
-
 import resume_agent
+import pytest
 
 
-class _FakeResponse:
-    def __init__(self, payload: bytes):
-        self._payload = payload
-
-    def read(self) -> bytes:
-        return self._payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
+def test_normalize_pasted_jd_text_preserves_internal_blank_lines() -> None:
+    raw = "\r\n  Title Line\r\n\r\nRequirement A\r\nRequirement B\r\n\r\n"
+    normalized = resume_agent._normalize_pasted_jd_text(raw)
+    assert normalized == "Title Line\n\nRequirement A\nRequirement B"
 
 
-def test_extract_ashby_job_text_via_posting_api_prefers_plain_text(monkeypatch) -> None:
-    def fake_urlopen(request, timeout=15):  # noqa: ARG001
-        assert request.full_url == "https://api.ashbyhq.com/posting-api/job-board/recraft"
-        payload = {
-            "jobs": [
-                {
-                    "title": "ML Engineer",
-                    "location": "Remote",
-                    "jobUrl": "https://jobs.ashbyhq.com/recraft/f9c15249-88f1-4e68-8eaf-03fff97971e5",
-                    "descriptionPlain": (
-                        "Build production-grade generative image systems. "
-                        "Collaborate with product, infra, and applied research to improve quality and speed."
-                    ),
-                }
-            ]
-        }
-        return _FakeResponse(json.dumps(payload).encode("utf-8"))
-
-    monkeypatch.setattr(resume_agent, "urlopen", fake_urlopen)
-
-    text = resume_agent._extract_ashby_job_text_via_posting_api(
-        "https://jobs.ashbyhq.com/recraft/f9c15249-88f1-4e68-8eaf-03fff97971e5"
+def test_prompt_for_jd_text_terminal_accepts_empty_lines(monkeypatch) -> None:
+    entries = iter(
+        [
+            "Senior ML Engineer",
+            "",
+            "Responsibilities",
+            "- Build systems",
+            "END_JD",
+        ]
     )
-    assert "Title: ML Engineer" in text
-    assert "Build production-grade generative image systems." in text
+    monkeypatch.setattr("builtins.input", lambda: next(entries))
+
+    pasted = resume_agent.prompt_for_jd_text_terminal()
+    assert pasted == "Senior ML Engineer\n\nResponsibilities\n- Build systems"
 
 
-def test_extract_ashby_job_text_via_posting_api_falls_back_to_html(monkeypatch) -> None:
-    def fake_urlopen(request, timeout=15):  # noqa: ARG001
-        assert request.full_url == "https://api.ashbyhq.com/posting-api/job-board/recraft"
-        payload = {
-            "jobs": [
-                {
-                    "title": "Platform Engineer",
-                    "applyUrl": "https://jobs.ashbyhq.com/recraft/f9c15249-88f1-4e68-8eaf-03fff97971e5/apply",
-                    "descriptionPlain": "Short",
-                    "descriptionHtml": (
-                        "<h1>Platform Engineer</h1><p>Build distributed systems with strong reliability focus, "
-                        "ship production features, and collaborate across teams.</p>"
-                    ),
-                }
-            ]
-        }
-        return _FakeResponse(json.dumps(payload).encode("utf-8"))
+def test_prompt_for_jd_text_auto_prefers_web(monkeypatch) -> None:
+    monkeypatch.setattr(resume_agent, "prompt_for_jd_text_web", lambda source_url=None: "JD from web")
+    monkeypatch.setattr(resume_agent, "prompt_for_jd_text_terminal", lambda end_marker="END_JD": "JD from terminal")
 
-    monkeypatch.setattr(resume_agent, "urlopen", fake_urlopen)
-
-    text = resume_agent._extract_ashby_job_text_via_posting_api(
-        "https://jobs.ashbyhq.com/recraft/f9c15249-88f1-4e68-8eaf-03fff97971e5"
-    )
-    assert "Platform Engineer" in text
-    assert "Build distributed systems with strong reliability focus" in text
+    pasted = resume_agent.prompt_for_jd_text("auto", source_url="https://example.com/job")
+    assert pasted == "JD from web"
 
 
-def test_fetch_jd_text_from_url_uses_ashby_api_first(monkeypatch) -> None:
-    called_urls: list[str] = []
+def test_prompt_for_jd_text_auto_falls_back_to_terminal(monkeypatch) -> None:
+    monkeypatch.setattr(resume_agent, "prompt_for_jd_text_web", lambda source_url=None: "")
+    monkeypatch.setattr(resume_agent, "prompt_for_jd_text_terminal", lambda end_marker="END_JD": "JD from terminal")
 
-    def fake_urlopen(request, timeout=15):  # noqa: ARG001
-        called_urls.append(request.full_url)
-        if request.full_url == "https://api.ashbyhq.com/posting-api/job-board/recraft":
-            payload = {
-                "jobs": [
-                    {
-                        "jobUrl": "https://jobs.ashbyhq.com/recraft/f9c15249-88f1-4e68-8eaf-03fff97971e5",
-                        "descriptionPlain": (
-                            "Design, build, and ship product-quality machine learning workflows in production. "
-                            "Partner with engineering and design to iterate quickly."
-                        ),
-                    }
-                ]
-            }
-            return _FakeResponse(json.dumps(payload).encode("utf-8"))
-        raise AssertionError("HTML fallback should not be called when Ashby API succeeds.")
+    pasted = resume_agent.prompt_for_jd_text("auto")
+    assert pasted == "JD from terminal"
 
-    monkeypatch.setattr(resume_agent, "urlopen", fake_urlopen)
 
-    text = resume_agent.fetch_jd_text_from_url(
-        "https://jobs.ashbyhq.com/recraft/f9c15249-88f1-4e68-8eaf-03fff97971e5"
-    )
-    assert "Design, build, and ship product-quality machine learning workflows" in text
-    assert called_urls == ["https://api.ashbyhq.com/posting-api/job-board/recraft"]
+def test_prompt_for_jd_text_web_mode_does_not_fallback(monkeypatch) -> None:
+    monkeypatch.setattr(resume_agent, "prompt_for_jd_text_web", lambda source_url=None: "")
+    monkeypatch.setattr(resume_agent, "prompt_for_jd_text_terminal", lambda end_marker="END_JD": "JD from terminal")
+
+    pasted = resume_agent.prompt_for_jd_text("web")
+    assert pasted == ""
+
+
+def test_prompt_for_jd_text_invalid_mode_raises() -> None:
+    with pytest.raises(ValueError):
+        resume_agent.prompt_for_jd_text("invalid")
